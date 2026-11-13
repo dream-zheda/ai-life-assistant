@@ -1,0 +1,33 @@
+import { defineConfig } from "vitest/config";
+import { fileURLToPath } from "node:url";
+
+const r = (p: string) => fileURLToPath(new URL(p, import.meta.url));
+
+/**
+ * 集成测试配置：直接连真实 PostgreSQL。
+ *
+ * 与单元测试分开跑，因为需要数据库在运行：
+ *   pnpm test        → 只跑 packages/*（无数据库依赖）
+ *   pnpm test:int    → 由 scripts/dev-db.mjs 起库后跑 apps/web/tests
+ */
+export default defineConfig({
+  resolve: {
+    alias: {
+      "@life/shared": r("./packages/shared/src/index.ts"),
+      "@life/domain": r("./packages/domain/src/index.ts"),
+      "@life/llm": r("./packages/llm/src/index.ts"),
+      "@life/channels": r("./packages/channels/src/index.ts"),
+      "@life/planning": r("./packages/planning/src/index.ts"),
+      "@life/db": r("./packages/db/src/index.ts"),
+    },
+  },
+  test: {
+    include: ["apps/*/tests/**/*.test.ts"],
+    environment: "node",
+    passWithNoTests: false,
+    // 集成测试相互依赖数据库状态，串行更稳
+    fileParallelism: false,
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
+  },
+});

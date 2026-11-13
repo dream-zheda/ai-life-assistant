@@ -1,0 +1,681 @@
+// ============================================================
+// AI 个人生活助手 —— 数据模型
+//
+// 设计依据：规划书 §9「数据结构设计」。
+// 三个反复出现的约束，在 schema 里都用结构表达，不靠"记得在代码里检查"：
+//   1. 任何个人业务数据都带 userId。
+//   2. 引用其他用户的对象要被外键挡住（用复合外键 [id, userId]）。
+//   3. 时间分两种：绝对时刻用 timestamptz；规则用「本地时间 + IANA 时区」。
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// 账号与认证
+// 字段形状按 Better Auth 的核心 schema 预留，接入时以其生成结果为准。
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+}
+
+model User {
+  id            String     @id @default(cuid())
+  email         String     @unique
+  emailVerified Boolean    @default(false)
+  name          String?
+  image         String?
+  role          UserRole   @default(USER)
+  status        UserStatus @default(ACTIVE)
+  // IANA 时区标识，例如 Asia/Shanghai。禁止在代码里写死单一时区。
+  timeZone      String     @default("Asia/Shanghai")
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  sessions       Session[]
+  accounts       Account[]
+  invitesCreated Invite[]        @relation("InviteCreatedBy")
+  profile        Profile?
+  goals          Goal[]
+  tasks          Task[]
+  fixedConstraints FixedConstraint[]
+  planVersions   PlanVersion[]
+  memories       Memory[]
+  conversations  Conversation[]
+  modelSetting   UserModelSetting?
+  settings       UserSettings?
+  channelBindings ChannelBinding[]
+  qqLinkCode      QqLinkCode?
+  notifications  Notification[]
+  usageRecords   UsageRecord[]
+  auditLogs      AuditLog[]
+  invitesUsed    Invite[]        @relation("InviteUsedBy")
+
+  @@map("users")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model Account {
+  id                    String    @id @default(cuid())
+  userId                String
+  accountId             String
+  providerId            String
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, accountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verifications")
+}
+
+// ---------------------------------------------------------------------------
+// 邀请注册
+// ---------------------------------------------------------------------------
+
+model Invite {
+  id          String    @id @default(cuid())
+  // 只存摘要，不存明文令牌
+  tokenHash   String    @unique
+  email       String?
+  role        UserRole  @default(USER)
+  createdById String
+  expiresAt   DateTime
+  usedAt      DateTime?
+  usedById    String?
+  createdAt   DateTime  @default(now())
+
+  createdBy User  @relation("InviteCreatedBy", fields: [createdById], references: [id])
+  usedBy    User? @relation("InviteUsedBy", fields: [usedById], references: [id])
+
+  @@index([expiresAt])
+  @@map("invites")
+}
+
+// ---------------------------------------------------------------------------
+// 个人档案与固定约束
+// ---------------------------------------------------------------------------
+
+model Profile {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  // 用户自由描述（原文），保留以便回溯"AI 整理是否失真"
+  rawInput  String?
+  // 结构化后的档案：背景、作息、偏好等
+  structured Json?
+  // 版本号用于检测"生成期间档案被修改"
+  version   Int      @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("profiles")
+}
+
+enum ConstraintKind {
+  WEEKLY
+  ONE_OFF
+}
+
+model FixedConstraint {
+  id             String         @id @default(cuid())
+  userId         String
+  kind           ConstraintKind
+  title          String
+  // ISO 星期：周一 = 1 … 周日 = 7；仅 WEEKLY 使用
+  weekday        Int?
+  // 仅 ONE_OFF 使用，YYYY-MM-DD（用户时区）
+  localDate      String?        @db.VarChar(10)
+  // 本地时刻 HH:mm。刻意不存 UTC：每周三 08:00 的课在夏令时切换后仍应是 08:00。
+  startTime      String         @db.VarChar(5)
+  endTime        String         @db.VarChar(5)
+  timeZone       String
+  // 一组约束（例如"每天睡觉"展开出的 7 条）共享同一个 groupId，
+  // 便于整组编辑/暂停/删除。单个约束为 null。
+  groupId        String?
+  effectiveFrom  DateTime?
+  effectiveUntil DateTime?
+  source         String         @default("user")
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, kind])
+  @@index([userId, groupId])
+  @@map("fixed_constraints")
+}
+
+// ---------------------------------------------------------------------------
+// 目标、任务、计划
+// ---------------------------------------------------------------------------
+
+enum GoalState {
+  ACTIVE
+  PAUSED
+  ACHIEVED
+  DROPPED
+}
+
+model Goal {
+  id          String    @id @default(cuid())
+  userId      String
+  title       String
+  description String?
+  priority    Int       @default(3)
+  state       GoalState @default(ACTIVE)
+  targetDate  String?   @db.VarChar(10)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tasks Task[]
+
+  // 供子表用复合外键引用，实现"关联对象必须属于同一用户"
+  @@unique([id, userId])
+  @@index([userId, state])
+  @@map("goals")
+}
+
+enum ActionState {
+  PENDING
+  IN_PROGRESS
+  PARTIALLY_DONE
+  DONE
+  SKIPPED
+  CANCELLED
+}
+
+model Task {
+  id              String      @id @default(cuid())
+  userId          String
+  goalId          String?
+  title           String
+  estimateMinutes Int?
+  state           ActionState @default(PENDING)
+  // AI 建议还是用户自己录入（规划书 §5：AI 建议必须可识别）
+  source          String      @default("ai")
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  goal Goal? @relation(fields: [goalId], references: [id])
+  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([id, userId])
+  @@index([userId, state])
+  @@map("tasks")
+}
+
+enum PlanState {
+  DRAFT
+  ACTIVE
+  SUPERSEDED
+  DISCARDED
+}
+
+model PlanVersion {
+  id          String    @id @default(cuid())
+  userId      String
+  // 用户时区下的本地日期 YYYY-MM-DD
+  localDate   String    @db.VarChar(10)
+  timeZone    String
+  version     Int
+  state       PlanState @default(DRAFT)
+  // 生成依据：当时的档案版本、目标快照等，用于事后解释"为什么这样排"
+  basis       Json?
+  modelId     String?
+  createdAt   DateTime  @default(now())
+  activatedAt DateTime?
+  supersededAt DateTime?
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items      PlanItem[]
+  notifications Notification[]
+
+  // 同一用户同一天不能有两个同版本号
+  @@unique([userId, localDate, version])
+  @@unique([id, userId])
+  @@index([userId, localDate, state])
+  @@map("plan_versions")
+}
+
+model PlanItem {
+  id            String   @id @default(cuid())
+  userId        String
+  planVersionId String
+  goalId        String?
+  taskId        String?
+  title         String
+  startsAt      DateTime
+  endsAt        DateTime
+  minutes       Int
+  // 用户锁定的条目在重排时不得移动
+  locked        Boolean  @default(false)
+  reason        String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // 复合外键：计划条目必须挂在本人、且确实存在的计划版本上
+  planVersion PlanVersion @relation(fields: [planVersionId, userId], references: [id, userId], onDelete: Cascade)
+  progressEvents ProgressEvent[]
+  notifications  Notification[]
+
+  @@unique([id, userId])
+  @@index([planVersionId])
+  @@index([userId, startsAt])
+  @@map("plan_items")
+}
+
+model ProgressEvent {
+  id         String      @id @default(cuid())
+  userId     String
+  planItemId String
+  state      ActionState
+  // 0–1，部分完成时保留实际进度
+  ratio      Float       @default(0)
+  note       String?
+  occurredAt DateTime    @default(now())
+
+  // 只经由复合外键挂到计划条目上：userId 由该外键保证一致，避免同一字段被两个关系复用
+  planItem PlanItem @relation(fields: [planItemId, userId], references: [id, userId], onDelete: Cascade)
+
+  @@index([planItemId, occurredAt])
+  @@map("progress_events")
+}
+
+// ---------------------------------------------------------------------------
+// 记忆
+// ---------------------------------------------------------------------------
+
+model Memory {
+  id         String    @id @default(cuid())
+  userId     String
+  content    String
+  // 来源：user / assistant / inferred
+  source     String
+  confirmed  Boolean   @default(false)
+  sensitive  Boolean   @default(false)
+  expiresAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("memories")
+}
+
+// ---------------------------------------------------------------------------
+// 对话
+// ---------------------------------------------------------------------------
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+model Conversation {
+  id               String   @id @default(cuid())
+  userId           String
+  channelBindingId String?
+  startedAt        DateTime @default(now())
+  lastMessageAt    DateTime @default(now())
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([userId, lastMessageAt])
+  @@map("conversations")
+}
+
+model Message {
+  id              String           @id @default(cuid())
+  conversationId  String
+  direction       MessageDirection
+  text            String
+  // 入站消息去重用的通道事件 ID（配合 inbound_events 使用）
+  externalEventId String?
+  createdAt       DateTime         @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+// ---------------------------------------------------------------------------
+// 模型服务
+// ---------------------------------------------------------------------------
+
+enum ProviderProtocol {
+  OPENAI_COMPATIBLE
+  ANTHROPIC
+}
+
+model ModelProvider {
+  id            String           @id @default(cuid())
+  name          String
+  protocol      ProviderProtocol
+  baseUrl       String
+  // 指向密钥管理中的键名，密钥本身不进数据库
+  credentialRef String
+  enabled       Boolean          @default(true)
+  createdAt     DateTime         @default(now())
+
+  models Model[]
+
+  @@map("model_providers")
+}
+
+model Model {
+  id          String   @id @default(cuid())
+  providerId  String
+  modelId     String
+  displayName String
+  enabled     Boolean  @default(true)
+  // 能力标记：是否支持 json mode、上下文长度等
+  capabilities Json?
+
+  provider ModelProvider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, modelId])
+  @@map("models")
+}
+
+model UserModelSetting {
+  id             String  @id @default(cuid())
+  userId         String  @unique
+  defaultModelId String?
+  dailyQuota     Int     @default(50)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_model_settings")
+}
+
+// ---------------------------------------------------------------------------
+// 提醒偏好：早报时间、免打扰、暂停、每日上限
+// ---------------------------------------------------------------------------
+
+model UserSettings {
+  id   String @id @default(cuid())
+  userId String @unique
+
+  // 早报时间（用户本地时刻 HH:mm）。原来是硬编码 7:00，现在按用户配置。
+  briefStartTime String @default("07:00") @db.VarChar(5)
+  // 提前多久提醒某一项行动
+  reminderLeadMinutes Int @default(10)
+
+  // 免打扰时段：两项都为 null 表示未设置；支持跨零点（23:00–07:00）
+  quietHoursStart String? @db.VarChar(5)
+  quietHoursEnd   String? @db.VarChar(5)
+
+  remindersPaused    Boolean @default(false)
+  maxRemindersPerDay Int     @default(8)
+
+  // ---- 模型配置（用户自己在页面上填）----
+  // Key 用 AES-256-GCM 加密后存这里，**明文不落库、不回传前端、不进导出**。
+  // 只额外存末四位用于界面提示。
+  llmProvider    String?
+  llmBaseUrl     String?
+  llmModel       String?
+  llmApiKeyCipher String?
+  llmApiKeyHint   String?  @db.VarChar(8)
+  llmUpdatedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_settings")
+}
+
+// ---------------------------------------------------------------------------
+// 微信通道
+// ---------------------------------------------------------------------------
+
+enum ChannelKind {
+  PERSONAL_WECHAT
+  WECHAT_PERSONAL_PROTOCOL
+  QQ_ONEBOT
+  OFFICIAL_ACCOUNT_SUBSCRIPTION
+  OFFICIAL_ACCOUNT_SERVICE
+  WECOM_APP
+  WECOM_KF
+}
+
+/// 协议登录的个人号会随时失效（下线、被限制、被封），所以要把登录态建模出来。
+/// 缺了这个字段，系统就无法区分"用户没回消息"和"账号已经死了"。
+enum ChannelSessionState {
+  /// 等待用户扫码
+  PENDING_SCAN
+  ACTIVE
+  /// 会话过期（长时间未登录）
+  EXPIRED
+  /// 主动断开（用户解绑）
+  DISCONNECTED
+  /// 疑似被封禁或被限制功能
+  BANNED
+}
+
+model ChannelBinding {
+  id              String      @id @default(cuid())
+  userId          String
+  channel         ChannelKind
+  externalUserId  String
+  externalDisplayName String?
+  // 推送窗口的唯一输入：用户最后一次发消息的时间。
+  // 个人微信只有 24 小时窗口，不存这个字段就无法判断"能不能推"。
+  lastInboundAt   DateTime?
+  verifiedAt      DateTime?
+  // 协议登录才有意义：会话由桥接服务持有，我们只存引用，绝不存密码
+  bridgeSessionId String?
+  sessionState    ChannelSessionState @default(ACTIVE)
+  lastHeartbeatAt DateTime?
+  disconnectedReason String?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  user         User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  inboundEvents InboundEvent[]
+  notifications Notification[]
+
+  @@unique([channel, externalUserId])
+  @@unique([userId, channel])
+  @@map("channel_bindings")
+}
+
+// 仅保存绑定码哈希；原文只在领取时返回，不进 URL、日志或消息历史。
+model QqLinkCode {
+  userId     String   @id
+  codeHash   String   @unique
+  botId      String
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime
+  consumedAt DateTime?
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("qq_link_codes")
+}
+
+model InboundEvent {
+  id               String    @id @default(cuid())
+  channelBindingId String
+  externalEventId  String
+  payload          Json?
+  receivedAt       DateTime  @default(now())
+  processedAt      DateTime?
+  failureReason    String?
+
+  channelBinding ChannelBinding @relation(fields: [channelBindingId], references: [id], onDelete: Cascade)
+
+  // 去重键必须包含通道实例，不能只用裸消息 ID
+  @@unique([channelBindingId, externalEventId])
+  @@index([processedAt])
+  @@map("inbound_events")
+}
+
+// ---------------------------------------------------------------------------
+// 后台任务（不引入 Redis，用 PostgreSQL 做队列）
+// ---------------------------------------------------------------------------
+
+enum JobState {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+model Job {
+  id          String   @id @default(cuid())
+  type        String
+  payload     Json
+  runAt       DateTime
+  state       JobState @default(PENDING)
+  attempts    Int      @default(0)
+  // 租约：worker 崩溃后到期可被重新领取
+  lockedUntil DateTime?
+  lockedBy    String?
+  lastError   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([state, runAt])
+  @@map("jobs")
+}
+
+// ---------------------------------------------------------------------------
+// 提醒与发送记录
+// ---------------------------------------------------------------------------
+
+enum NotificationState {
+  SCHEDULED
+  SENT
+  FALLBACK_REQUIRED
+  CANCELLED
+  FAILED
+}
+
+model Notification {
+  id               String            @id @default(cuid())
+  userId           String
+  planVersionId    String?
+  planItemId       String?
+  kind             String
+  // 幂等键：同一计划条目的同一类提醒只能有一条
+  dedupeKey        String            @unique
+  content          String
+  scheduledAt      DateTime
+  state            NotificationState @default(SCHEDULED)
+  createdAt        DateTime          @default(now())
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  planVersion    PlanVersion?    @relation(fields: [planVersionId], references: [id], onDelete: SetNull)
+  planItem       PlanItem?       @relation(fields: [planItemId], references: [id], onDelete: SetNull)
+  channelBinding ChannelBinding? @relation(fields: [channelBindingId], references: [id], onDelete: SetNull)
+  channelBindingId String?
+  attempts       NotificationAttempt[]
+
+  @@index([state, scheduledAt])
+  @@map("notifications")
+}
+
+model NotificationAttempt {
+  id             String   @id @default(cuid())
+  notificationId String
+  attemptedAt    DateTime @default(now())
+  // accepted / failed / unknown —— 没有 delivered
+  outcome        String
+  code           String?
+
+  notification Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+
+  @@index([notificationId, attemptedAt])
+  @@map("notification_attempts")
+}
+
+// ---------------------------------------------------------------------------
+// 用量与审计
+// ---------------------------------------------------------------------------
+
+model UsageRecord {
+  id           String   @id @default(cuid())
+  userId       String
+  providerId   String
+  modelId      String
+  inputTokens  Int
+  outputTokens Int
+  costMicros   Int?
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("usage_records")
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  actorUserId String?
+  action      String
+  targetType  String?
+  targetId    String?
+  result      String?
+  createdAt   DateTime @default(now())
+
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@map("audit_logs")
+}

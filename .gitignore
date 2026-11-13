@@ -1,0 +1,21 @@
+node_modules/
+.pnpm-store/
+# prisma generate 的产物，不进版本库
+packages/db/generated/
+dist/
+.next/
+coverage/
+tmp/
+*.log
+.env
+.env.local
+.env.*.local*
+.DS_Store
+*.tsbuildinfo
+
+# 本地开发用 Postgres 数据目录（若使用 embedded-postgres）
+.embedded-postgres/
+.pgdata/
+
+# 参考文档中不随包分发的内容
+!.env.example

@@ -1,0 +1,22 @@
+{
+  "name": "@life/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/index.ts",
+    "once": "tsx src/index.ts --once"
+  },
+  "dependencies": {
+    "@life/channels": "workspace:*",
+    "@life/db": "workspace:*",
+    "@life/domain": "workspace:*",
+    "@life/llm": "workspace:*",
+    "@life/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.15"
+  }
+}

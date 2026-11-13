@@ -1,0 +1,100 @@
+name: life-assistant
+
+# 生产拓扑：db → migrate（一次性）→ web / worker
+#
+# 关键点：
+# 1. 数据库不暴露到公网，只绑定 127.0.0.1（宿主机本地调试用）；生产可整行删掉。
+# 2. 迁移作为独立的一次性服务，web/worker 等它成功退出后才启动。
+#    —— 否则两个进程会同时尝试迁移，或者带着旧 schema 启动。
+# 3. web 与 worker 共享同一个 DATABASE_URL 与应用配置。
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-life}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?必须设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-life_assistant}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-life} -d ${POSTGRES_DB:-life_assistant}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "127.0.0.1:${DB_PUBLISH_PORT:-5432}:5432"
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migrate
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-life}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-life_assistant}?schema=public
+    restart: "no"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: web
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-life}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-life_assistant}?schema=public
+      APP_BASE_URL: ${APP_BASE_URL:?必须设置 APP_BASE_URL，且要与实际访问地址一致}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?必须设置 BETTER_AUTH_SECRET}
+      ONEBOT_ENDPOINT: ${ONEBOT_ENDPOINT:-}
+      ONEBOT_TOKEN: ${ONEBOT_TOKEN:-}
+      ONEBOT_SECRET: ${ONEBOT_SECRET:-}
+      ONEBOT_SELF_ID: ${ONEBOT_SELF_ID:-}
+      ONEBOT_AUTO_ACCEPT_FRIENDS: ${ONEBOT_AUTO_ACCEPT_FRIENDS:-false}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3100}:3100"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/sign-in').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-life}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-life_assistant}?schema=public
+      WORKER_TICK_MS: ${WORKER_TICK_MS:-15000}
+      ONEBOT_ENDPOINT: ${ONEBOT_ENDPOINT:-}
+      ONEBOT_TOKEN: ${ONEBOT_TOKEN:-}
+      ONEBOT_SECRET: ${ONEBOT_SECRET:-}
+      ONEBOT_SELF_ID: ${ONEBOT_SELF_ID:-}
+      ONEBOT_AUTO_ACCEPT_FRIENDS: ${ONEBOT_AUTO_ACCEPT_FRIENDS:-false}
+      WORKER_HTTP_PORT: 8789
+      WORKER_HTTP_HOST: 0.0.0.0
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "127.0.0.1:${WORKER_HTTP_PORT:-8789}:8789"
+    restart: unless-stopped
+
+volumes:
+  db-data:
